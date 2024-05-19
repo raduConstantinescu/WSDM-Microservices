@@ -1,3 +1,18 @@
+'''
+THIS MICROSERVICE IS RESPONSIBLE FOR HANDLING ORDERS
+
+IT PROVIDES THE FOLLOWING ENDPOINTS:
+    - /create/<user_id> : Creates an order for a user
+    - /find/<order_id> : Finds an order by its id
+    - /addItem/<order_id>/<item_id>/<quantity> : Adds an item to an order
+    - /checkout/<order_id> : Checks out an order
+    - /batch_init/<n>/<n_items>/<n_users>/<item_price> : Initializes n orders with n_items per order and n_users users
+
+IT COMMUNICATES TO OTHER MICROSERVICES THROUGH RABBITMQ AND HTTP REQUESTS
+
+- IT PUBLISHES THE EVENT "order_created" TO THE STOCK MICROSERVICE
+- IT CONSUMES THE EVENT "payment_processed" TO UPDATE THE ORDER STATUS
+'''
 import logging
 import os
 import atexit
@@ -10,6 +25,10 @@ import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+import sys
+
+from helpers import consume_event, publish_event
+
 
 
 DB_ERROR_STR = "DB error"
@@ -140,42 +159,30 @@ def add_item(order_id: str, item_id: str, quantity: int):
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
-
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
+    # Publish order_created event
+    publish_event("order_created", {"order_id": order_id, "user_id": order_entry.user_id, "items": order_entry.items, "total_cost": order_entry.total_cost})
+    return Response("Checkout initiated", status=200)
+
+def handle_payment_processed(event):
+    order_id = event['order_id']
+    # Update order status
+    order_entry: OrderValue = get_order_from_db(order_id)
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+        abort(400, "DB error")
+    app.logger.debug(f"Order {order_id} payment processed successfully")
+
+def handle_payment_failed(event):
+    app.logger.debug(f"Order {event.order_id} payment failed, stock rolled back")
+
+def handle_stock_subtraction_failed(event):
+    app.logger.debug(f"Stock subtraction failed for order {event.order_id}, reason: {event.reason}")
 
 
 if __name__ == '__main__':
@@ -184,3 +191,14 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+
+#PASSIVELY CONSUME THE PAYMENT PROCESSED EVENT TO UPDATE ORDER STATUS
+consume_event("payment_processed", handle_payment_processed)
+
+#PASSIVELY CONSUME THE PAYMENT FAILED EVENT TO ROLLBACK ORDER STATUS
+consume_event("payment_failed", handle_payment_failed)
+
+#PASSIVELY CONSUME THE STOCK SUBTRACTION FAILED EVENT TO ROLLBACK STOCK SUBTRACTION
+consume_event("stock_subtraction_failed", handle_stock_subtraction_failed)
+
+
