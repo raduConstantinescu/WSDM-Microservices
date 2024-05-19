@@ -7,7 +7,9 @@ import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+import sys
 
+from helpers import consume_event, publish_event
 
 DB_ERROR_STR = "DB error"
 
@@ -108,6 +110,32 @@ def remove_stock(item_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
+def handle_order_created(event):
+    items = event['items']
+    order_id = event['order_id']
+    user_id = event['user_id']
+    total_cost = event['total_cost']
+    removed_items = []
+    
+    # Subtract stock for each item
+    try:
+        for item_id, quantity in items:
+            remove_stock(item_id, quantity)
+            removed_items.append((item_id, quantity))
+        # Publish stock_subtracted event
+        publish_event("stock_subtracted", {"order_id": order_id, "user_id": user_id, "total_cost": total_cost})
+    except Exception as e:
+        # Publish stock_subtraction_failed event with removed items for rollback
+        for item, quantity in removed_items:
+            add_stock(item, quantity)
+        publish_event("stock_subtraction_failed", {"order_id": order_id, "user_id": user_id, "total_cost": total_cost, "reason": str(e), "removed_items": removed_items})
+
+def handle_payment_failed(event):
+    items = event['items']
+    # Add stock back for each item
+    for item_id, quantity in items:
+        add_stock(item_id, quantity)
+    app.logger.debug(f"Stock rolled back for items: {items}")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
@@ -115,3 +143,6 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+
+# PASSIVELY CONSUME THE 
+consume_event("payment_failed", handle_payment_failed)
