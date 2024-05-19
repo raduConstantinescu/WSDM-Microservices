@@ -1,6 +1,5 @@
-version: "3"
+version: "3.8"
 services:
-
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -8,20 +7,27 @@ services:
     ports:
       - "8000:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      rabbitmq:
+        condition: service_healthy
+      order-service:
+        condition: service_started
+      stock-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
 
   order-service:
     build: ./order
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - RABBITMQ_HOST=rabbitmq
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      rabbitmq:
+        condition: service_healthy
 
   order-db:
     image: redis:7.2-bookworm
@@ -30,11 +36,14 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      - RABBITMQ_HOST=rabbitmq
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      rabbitmq:
+        condition: service_healthy
 
   stock-db:
     image: redis:7.2-bookworm
@@ -43,12 +52,26 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    environment:
+      - RABBITMQ_HOST=rabbitmq
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      rabbitmq:
+        condition: service_healthy
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5672"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
