@@ -7,6 +7,10 @@ import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+import sys
+
+from helpers import consume_event, publish_event
+
 
 DB_ERROR_STR = "DB error"
 
@@ -54,6 +58,21 @@ def create_user():
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
+@app.get('/all_users')
+def all_users():
+    try:
+        # Get all keys in the Redis database
+        keys = db.keys('*')
+        users = []
+        for key in keys:
+            user_entry: UserValue = get_user_from_db(key.decode('utf-8'))
+            users.append({
+                "user_id": key.decode('utf-8'),
+                "credit": user_entry.credit
+            })
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return jsonify(users)
 
 @app.post('/batch_init/<n>/<starting_money>')
 def batch_init_users(n: int, starting_money: int):
@@ -105,6 +124,31 @@ def remove_credit(user_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
+# PROCESS PAYMENT, similar to remove_credit but not linked to a route.
+def process_payment(user_id: str, amount: int):
+    user_entry: UserValue = get_user_from_db(user_id)
+    if user_entry.credit < amount:
+        abort(400, f"User {user_id} does not have enough credit")
+    user_entry.credit -= amount
+    try:
+        db.set(user_id, msgpack.encode(user_entry))
+    except redis.exceptions.RedisError:
+        abort(400, "DB error")
+
+def handle_stock_subtracted(event):
+    user_id = event['user_id']
+    amount = event['total_cost']
+    order_id = event['order_id']
+    # Process payment
+    try:
+        process_payment(user_id, amount)
+        # Publish payment_processed event, handled by the order service
+        publish_event("payment_processed", {"order_id": order_id, "user_id": user_id, "total_cost": amount})
+    except Exception as e:
+        print(e)
+        # Publish payment_failed event, handled by the order service.
+        publish_event("payment_failed", {"order_id": order_id, "user_id": user_id, "total_cost": amount, "reason": str(e)})
+
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
@@ -112,3 +156,6 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
+
+# PASSIVELY CONSUME THE STOCK SUBTRACTED EVENT TO PROCESS PAYMENT
+consume_event("stock_subtracted", handle_stock_subtracted)
